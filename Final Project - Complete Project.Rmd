@@ -1,0 +1,525 @@
+---
+title: 'Final Project : Complete Project'
+author: "Dhyana"
+date: "2025-05-03"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)  
+library(dplyr)
+library(ggplot2)
+library(tsibble)
+library(readr)
+library(usmap)
+library(broom)
+library(fable)
+library(feasts)
+library(zoo)
+```
+
+# Final Project
+
+## State Information
+- **State Name**: New Jersey
+- **State Abbreviation**: NJ
+- **State FIPS Code**: 34
+
+## 1. Data Preparation
+
+### 1.1 SAIPE Data
+
+```{r}
+SAIPE_NJ <- read.csv("~/Downloads/SAIPE_11-04-2025.csv")
+clean_data <- SAIPE_NJ |>
+  select(Year, ID, Name, Poverty.Universe, Number.in.Poverty) |>
+  rename(
+    FIPS = ID,
+    County = Name,
+    Population = Poverty.Universe,
+    Poverty = Number.in.Poverty
+  )
+
+clean_data <- clean_data[nchar(clean_data$FIPS) == 5, ] # Exactly 5 characters
+clean_data <- clean_data[clean_data$FIPS != 34000, ] # Removing new jersey
+# Total number of counties in New Jersey
+clean_data |>
+  distinct(FIPS, County) |>
+  count()
+# Converting to numeric
+clean_data <- clean_data |>
+  filter(Population != "--") |>
+  mutate(
+    Population = gsub (",", "", Population),
+    Population = as.numeric(Population))
+# Largest county
+largest_county <- clean_data |>
+  filter(Year == 2023) |> # 2023 is the latest year
+  arrange(desc(Population)) |>
+  slice(1)
+largest_county |>
+  select(County, Population)
+# 9 largest counties
+top_9 <- clean_data |>
+  filter(Year == 2023) |>
+  arrange(desc(Population)) |>
+  slice_head(n = 9)
+top_9 |>
+  select(County, Population)
+
+# Population map
+data_2023 <- clean_data[clean_data$Year == 2023, ]
+data_2023 <- data_2023 |>
+  rename(fips = FIPS)
+plot_usmap(
+  data = data_2023,
+  regions = "counties",
+  include = "NJ",
+  values = "Population"
+) +
+  labs(
+    title = "New Jersey County Population"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.key.width = unit(2, "cm"),
+    legend.margin = margin(t = 5, unit = "pt")
+  )
+# Time Plot
+clean_data$Poverty <- as.numeric(gsub(",", "", clean_data$Poverty))
+top9_name <- top_9$County
+top9_poverty <- clean_data[clean_data$County %in% top9_name, ]
+ggplot(top9_poverty, aes(x = Year, y = Poverty)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~ County, scales = "free_y") +
+  labs(
+    title = "Poverty in top 9 counties",
+    x = "Year",
+    y = "People in Poverty"
+  )
+```
+
+### 1.2 County SNAP Benefits
+```{r}
+snap_data <- read_csv("~/Creative Cloud Files/cleaned_cntysnap.csv")
+snap_data <- snap_data |>
+  rename(
+    state_fips = `State FIPS code`,
+    county_fips = `County FIPS code`,
+    county_name = Name
+  )
+SNAP_NJ <- snap_data |>
+  filter(state_fips == 34, county_fips != 0) |>
+  mutate(FIPS = as.character(state_fips * 1000 + county_fips))
+SNAP_NJ <- SNAP_NJ |>
+  mutate(across(starts_with("Jul-"), as.numeric))
+snap_long <- SNAP_NJ |>
+  pivot_longer(
+    cols = starts_with("Jul-"),
+    names_to = "Year",
+    values_to = "SNAP"
+  ) |>
+  mutate(Year = as.numeric(sub("Jul-", "", Year)))
+top_9$FIPS <- as.character(top_9$FIPS)
+snap_long$FIPS <- as.character(snap_long$FIPS)
+top9_fips <- top_9$FIPS # Top 9
+top9_snap <- snap_long |>
+  filter(FIPS %in% top9_fips)
+top9_snap <- top9_snap |>
+  filter(!is.na(SNAP))
+# Time PLot
+ggplot(top9_snap, aes(x = Year, y = SNAP)) +
+  geom_line(color = "darkgreen") +
+  facet_wrap(~ county_name) +
+  labs(
+    title = "SNAP Benefit Trends for Top 9 NJ Counties (by FIPS)",
+    x = "Year",
+    y = "SNAP"
+  )
+```
+
+### 1.3 State IRS Data
+```{r}
+irs_data <- read_csv("~/Creative Cloud Files/cleaned_irs.csv")
+# Filtering for New Jersey
+IRS_NJ <- irs_data |>
+  filter(Name == "New Jersey") |>
+  mutate(`Poor exemptions` = as.numeric(`Poor exemptions`)) # Converting to numeric
+# Time Plot
+ggplot(IRS_NJ, aes(x = Year, y = `Poor exemptions`)) +
+  geom_line(color = "purple") +
+  labs(
+    title = "Poor Exemptions filed in New Jersey",
+    x = "Year",
+    y = "Number of Poor Exemptions"
+  )
+```
+
+### 1.4 Merging the data
+```{r}
+clean_data <- clean_data |>
+  mutate(FIPS = as.character(FIPS))
+snap_long <- snap_long |>
+  mutate(FIPS = as.character(FIPS))
+# Merging SAIPE and SNAP
+merged_data <- clean_data |>
+  filter(Year >= 1997) |>
+  left_join(
+    snap_long |>
+      filter(Year >= 1997) |>
+      select(FIPS, Year, SNAP),
+    by = c("FIPS", "Year"))
+# Adding IRS
+merged_data <- merged_data |>
+  left_join(
+    IRS_NJ |>
+      filter(Year >= 1997) |>
+      select(Year, `Poor exemptions`), 
+    by = "Year"
+  )
+# Removing missing values
+merged_data <- merged_data |>
+  filter(
+    !is.na(Poverty),
+    !is.na(Population),
+    !is.na(SNAP),
+    !is.na(`Poor exemptions`)
+  )
+# Converting to a tsibble
+merged_tsibble <- merged_data |>
+  as_tsibble(key = c(FIPS, County), index = Year)
+# Visualization 1 - Poverty vs SNAP
+ggplot(merged_tsibble, aes(x = SNAP, y = Poverty, color = County)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Relationship between SNAP and Poverty",
+    x = "SNAP",
+    y = "Poverty"
+  )
+# Visualization 2 - Poverty vs Population
+ggplot(merged_tsibble, aes(x = Population, y = Poverty, color = County)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Relationship between Population and Poverty",
+    x = "Population",
+    y = "Poverty"
+  )
+# Visualization 3 - Poverty vs Poor Exemptions
+ggplot(merged_tsibble, aes(x = `Poor exemptions`, y = Poverty, color = County)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Relationship between Poor Exemptions and Poverty",
+    x = "Poor Exemptions",
+    y = "Poverty"
+  )
+```
+
+## 2. Linear Models
+
+### 2.1 Variable Selection
+```{r}
+final_data <- merged_tsibble
+# Log-transformed variables
+final_data <- final_data |>
+  mutate(
+    log_poverty = log(Poverty),
+    log_population = log(Population),
+    log_snap = log(SNAP),
+    log_poor_exemptions = log(`Poor exemptions`)
+  )
+# 7 Linear Models
+model_1 <- lm(log_poverty ~ log_population, data = final_data) 
+model_2 <- lm(log_poverty ~ log_snap, data = final_data) 
+model_3 <- lm(log_poverty ~ log_poor_exemptions, data = final_data) 
+model_4 <- lm(log_poverty ~ log_population + log_snap, data = final_data) 
+model_5 <- lm(log_poverty ~ log_population + log_poor_exemptions, data = final_data)
+model_6 <- lm(log_poverty ~ log_snap + log_poor_exemptions, data = final_data)
+model_7 <- lm(log_poverty ~ log_population + log_snap + log_poor_exemptions, data = final_data) 
+models_list <- list(model_1, model_2, model_3, model_4, model_5, model_6, model_7)
+# Summary of each model
+summary_1 <- glance(model_1)
+summary_2 <- glance(model_2)
+summary_3 <- glance(model_3)
+summary_4 <- glance(model_4)
+summary_5 <- glance(model_5)
+summary_6 <- glance(model_6)
+summary_7 <- glance(model_7)
+# All summaries into a table
+model_summary <- bind_rows(
+  summary_1,
+  summary_2,
+  summary_3,
+  summary_4,
+  summary_5,
+  summary_6,
+  summary_7
+)
+model_summary <- model_summary |>
+  mutate(model_number = 1:7) |>
+  select(model_number, adj.r.squared, AIC, BIC)
+print(model_summary)
+# Best model
+best_model <- model_summary |>
+  filter(AIC == min(AIC))
+print(paste("Best model is model number:", best_model$model_number))
+best_model <- model_7
+# Predicting values
+predict_values <- predict(best_model, newdata = final_data)
+final_data <- final_data |>
+  mutate(predict_log_poverty = predict_values)
+# Converting log values back to normal
+final_data <- final_data |>
+  mutate(
+    real_poverty = exp(log_poverty),
+    predict_poverty = exp(predict_log_poverty)
+  )
+# Top 9 Counties
+top_9_data <- final_data |>
+  filter(County %in% top_9$County)
+# Plot
+ggplot(top_9_data, aes(x = Year)) +
+  geom_line(aes(y = real_poverty, color = "Actual Poverty")) +
+  geom_line(aes(y = predict_poverty, color = "Predicted Poverty")) +
+  facet_wrap((~County)) +
+  labs(
+    title = "Actual vs Predicted Poverty",
+    x = "Year",
+    y = "Number of People in Poverty"
+  )
+```
+
+### 2.2 Residual Analysis
+```{r}
+# Innovation Residuals
+top_9_data <- top_9_data |>
+  mutate(
+    innovation_residual = log_poverty - predict_log_poverty
+  )
+# Time Plot
+ggplot(top_9_data, aes(x = Year, y = innovation_residual)) +
+  geom_line(color = "purple") +
+  facet_wrap((~County)) +
+  labs(
+    title = "Innovation Residuals Over Time for Top 9 Counties",
+    x = "Year",
+    y = "Innovation Residual"
+  )
+# Ljung - Box Test
+ljung_box <- top_9_data |>
+  as_tibble() |>
+  group_by(County) |>
+  summarize(
+    p_value = Box.test(innovation_residual, lag = 10, type = "Ljung-Box")$p.value
+  )
+print(ljung_box)
+# Only 1 county has residuals different from white noise that is the Middlesex County
+# With a high adjusted R^2 (0.981) and a strong relationship between actual and predicted values, 
+#the linear model performs well in predicting poverty
+# According to the Ljung-Box test, innovation residuals seemed random for 8 of the 9 counties,
+#indicating that the model fits the data well generally
+```
+
+## 3. Stochastic Models
+
+### 3.1 Single County Forecasts
+```{r}
+largest_county_name <- largest_county$County[1]
+county_data <- final_data |>
+  filter(County == largest_county_name) |>
+  select(Year, log_poverty)
+largest_county_ts <- county_data |>
+  as_tsibble(index = Year) |>
+  tsibble::fill_gaps()
+largest_county_ts <- largest_county_ts |>
+  mutate(log_poverty = na.approx(log_poverty, x = Year, na.rm = FALSE))
+# Models
+county_models <- largest_county_ts |> 
+  model(
+  naive = NAIVE(log_poverty),
+  mean = MEAN(log_poverty),
+  ses = ETS(log_poverty ~ error("A") + trend("N") + season("N")),
+  holt = ETS(log_poverty ~ error("A") + trend("A") + season("N")),
+  holt_damped = ETS(log_poverty ~ error("A") + trend("Ad") + season("N")),
+  arima = ARIMA(log_poverty)
+)
+forecasts <- county_models |> 
+  forecast(h = 5)
+autoplot(forecasts, largest_county_ts) +
+  labs(
+    title = "5-Year Forecasts for Log Poverty in Largest NJ County",
+    x = "Year",
+    y = "Log Poverty"
+  ) +
+  facet_wrap(~.model)
+# Model Quality
+model_accuracy <- accuracy(county_models)
+print(model_accuracy)
+# Among all models, the Holt's damped trend method performed best
+# It has lowest RMSE and MAE 
+# It's forecast trend is stable, with tighter confidence intervals compared to
+# ARIMA and other methods
+```
+
+### 3.2 Exponential Smoothing Models
+```{r}
+final_data <- final_data |>
+  mutate(log_poverty = log(Poverty))
+exp_models <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year) |>
+  tsibble::fill_gaps() |>
+  group_by(County) |>
+  mutate(log_poverty = zoo::na.approx(log_poverty, x = Year, na.rm = FALSE)) |>
+  ungroup()
+exp_models_fitted <- exp_models |>
+  model(
+    SES = ETS(log_poverty ~ error("A") + trend("N") + season("N")),
+    Holt = ETS(log_poverty ~ error("A") + trend("A") + season("N")),
+    Holt_Damped = ETS(log_poverty ~ error("A") + trend("Ad") + season("N"))
+  )
+model_accuracy <- accuracy(exp_models_fitted)
+ggplot(model_accuracy, aes(x = .model, y = RMSE, fill.model)) +
+  geom_col() +
+  facet_wrap(~ County) +
+  labs(
+    title = "RMSE Comparison of Exponential Smoothing Models Across NJ Counties",
+    x = "County",
+    y = "RMSE",
+    color = "Model"
+  )
+# I selected the Holt's damped trend model as it has the lowest RMSE in most
+# counties, indicating the best overall forecast accuracy for poverty trends in
+# New Jersey
+```
+
+### 3.3 ARIMA Models
+```{r}
+arima_models <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year) |>
+  tsibble::fill_gaps() |>
+  group_by(County) |>
+  mutate(log_poverty = zoo::na.approx(log_poverty, x = Year, na.rm = FALSE)) |>
+  ungroup() |>
+  model(auto_arima = ARIMA(log_poverty))
+# ARIMA structure for each county
+for (i in 1:nrow(arima_models)) {
+  cat("County:", arima_models$County[i], "\n")
+  print(report(arima_models$auto_arima[[i]]))
+  cat("\n")
+}
+# The most commonly selected models by auto ARIMA across New Jersey counties are
+# ARIMA(0,1,0) = selected for 9 counties
+# ARIMA(1,0,0) with mean = selected for 6 counties
+# ARIMA(0,1,1) and variations = selected for 4 counties
+# 3 ARIMA Models
+common_models_data <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year) |>
+  tsibble::fill_gaps() |>
+  group_by(County) |>
+  mutate(log_poverty = zoo::na.approx(log_poverty, x = Year, na.rm = FALSE)) |>
+  ungroup()
+common_models <- common_models_data |>
+  model(
+    ARIMA_010 = ARIMA(log_poverty ~ pdq(0,1,0)),
+    ARIMA_100_mean = ARIMA(log_poverty ~ pdq(1,0,0)),
+    ARIMA_011 = ARIMA(log_poverty ~ pdq(0,1,1))
+    )
+# Model Quality
+comparison <- accuracy(common_models)
+comparison_summary <- comparison |>
+  group_by(.model) |>
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE)) |>
+  arrange(mean_RMSE)
+print(comparison_summary)
+
+# ARIMA(0,1,1) is the best model because it has the lowest RMSE 
+```
+# 3.4 Cross Validation
+```{r}
+cross_validation_data <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year) |>
+  tsibble::fill_gaps() |>
+  group_by(County) |>
+  filter(!is.na(Poverty)) |>  
+  mutate(log_poverty = log(Poverty)) |>
+  filter(!is.infinite(log_poverty)) |>
+  ungroup() |>
+  stretch_tsibble(.init = 10, .step = 1)
+cross_validation_model <- cross_validation_data |>
+  model(
+    ETS = ETS(log_poverty ~ error("A") + trend("Ad") + season("N")),
+    ARIMA = ARIMA(log_poverty ~ pdq(1,0,0))
+  )
+# Forecast 5 years
+cross_validation_forecast <- cross_validation_model |>
+  forecast(h = 5)
+cross_validation_accuracy_data <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year)
+cross_validation_accuracy <- cross_validation_forecast |> 
+  accuracy(cross_validation_accuracy_data)
+rmse_model <- cross_validation_accuracy |>
+  group_by(.model) |>
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE)) |>
+  arrange(mean_RMSE)
+print(rmse_model)
+# ETS is the better choice for statewide poverty forecasting as it has the 
+# lowest RMSE that is 0.144
+```
+# 4. Forecasts
+```{r}
+forecast_data <- final_data |>
+  as_tsibble(key = c(FIPS, County), index = Year) |>
+  tsibble::fill_gaps() |>
+  group_by(County) |>
+  mutate(
+    log_poverty = log(Poverty),
+    log_poverty = na.approx(log_poverty, x = Year, na.rm = FALSE)
+  ) |>
+  ungroup() |>
+  filter(!is.infinite(log_poverty))
+ets_forecast_model <- forecast_data |>
+  model(ETS = ETS(log_poverty ~ error("A") + trend("Ad") + season("N")))
+ets_forecast <- ets_forecast_model |>
+  forecast(h = 5)
+latest_year <- max(forecast_data$Year)
+forecast_2028 <- ets_forecast |>
+  filter(Year == latest_year + 5) |>
+  as_tibble() |>
+  mutate(predicted_poverty = exp(.mean)) |>
+  select(FIPS, County, predicted_poverty)
+current_data <- final_data |>
+  filter(Year == latest_year) |>
+  select(FIPS, County, Poverty, Population)
+poverty_change <- forecast_2028 |>
+  left_join(current_data, by = c("FIPS", "County")) |>
+  mutate(
+    increase = predicted_poverty - Poverty,
+    percent_increase = 100 * (increase / Population)
+  )
+# Top 5 Counties
+top_5_counties <- poverty_change |>
+  arrange(desc(percent_increase)) |>
+  slice_head(n = 5)
+print(top_5_counties |> select(County, percent_increase))
+# Map
+map_data <- poverty_change |>
+  mutate(fips = FIPS) |>
+  select(fips, percent_increase)
+# Plot
+plot_usmap(
+  data = map_data, 
+  regions = "counties", 
+  include = "NJ", 
+  values = "percent_increase"
+) +
+  labs(
+    title = "Forecasted 5-Year % Increase in Poverty by NJ County",
+    fill = "% Increase"
+  ) 
+```
